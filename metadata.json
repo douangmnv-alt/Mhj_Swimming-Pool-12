@@ -1,0 +1,5 @@
+{
+  "name": "Sale Tracker",
+  "description": "Record sale transactions, edit menu prices, filter entries by date, and export professional PDF or CSV reports.",
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
