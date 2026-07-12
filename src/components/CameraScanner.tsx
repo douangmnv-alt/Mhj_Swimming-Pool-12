@@ -3,10 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, X, AlertTriangle, RefreshCw } from "lucide-react";
 
-type Html5QrcodeClass = typeof import("html5-qrcode").Html5Qrcode;
+type Html5QrcodeModule = typeof import("html5-qrcode");
+type Html5QrcodeClass = Html5QrcodeModule["Html5Qrcode"];
 type Html5QrcodeInstance = InstanceType<Html5QrcodeClass>;
 
 interface CameraScannerProps {
@@ -20,26 +21,74 @@ export default function CameraScanner({ onScan, onClose, title = "Scan Barcode /
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState<string>("");
   const [isInitializing, setIsInitializing] = useState(true);
+  const [cameraLoadToken, setCameraLoadToken] = useState(0);
+  const [restartToken, setRestartToken] = useState(0);
   
   const scannerRef = useRef<Html5QrcodeInstance | null>(null);
-  const html5QrcodeClassRef = useRef<Html5QrcodeClass | null>(null);
-  const regionId = "web-barcode-scanner-viewport";
+  const html5QrcodeModuleRef = useRef<Html5QrcodeModule | null>(null);
+  const onScanRef = useRef(onScan);
+  const lastScanRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
+  const regionIdRef = useRef(`web-barcode-scanner-viewport-${Math.random().toString(36).slice(2)}`);
+  const regionId = regionIdRef.current;
 
-  const loadHtml5Qrcode = async () => {
-    if (!html5QrcodeClassRef.current) {
-      const module = await import("html5-qrcode");
-      html5QrcodeClassRef.current = module.Html5Qrcode;
+  useEffect(() => {
+    onScanRef.current = onScan;
+  }, [onScan]);
+
+  const loadHtml5Qrcode = useCallback(async () => {
+    if (!html5QrcodeModuleRef.current) {
+      html5QrcodeModuleRef.current = await import("html5-qrcode");
     }
-    return html5QrcodeClassRef.current;
+    return html5QrcodeModuleRef.current;
+  }, []);
+
+  const getSupportedFormats = (module: Html5QrcodeModule) => {
+    const formats = module.Html5QrcodeSupportedFormats;
+    return [
+      formats.QR_CODE,
+      formats.EAN_13,
+      formats.EAN_8,
+      formats.UPC_A,
+      formats.UPC_E,
+      formats.CODE_128,
+      formats.CODE_39,
+      formats.ITF
+    ];
   };
+
+  const stopScanner = useCallback(async () => {
+    const scanner = scannerRef.current;
+    if (!scanner) return;
+
+    try {
+      if (scanner.isScanning) {
+        await scanner.stop();
+      }
+    } catch (err) {
+      console.warn("Scanner stop ignored", err);
+    }
+
+    try {
+      await (scanner as any).clear?.();
+    } catch (err) {
+      console.warn("Scanner clear ignored", err);
+    }
+
+    if (scannerRef.current === scanner) {
+      scannerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
 
     const loadCameras = async () => {
       try {
-        const Html5Qrcode = await loadHtml5Qrcode();
-        const devices = await Html5Qrcode.getCameras();
+        setIsInitializing(true);
+        setError(null);
+
+        const module = await loadHtml5Qrcode();
+        const devices = await module.Html5Qrcode.getCameras();
         if (cancelled) return;
         if (devices && devices.length > 0) {
           setCameras(devices);
@@ -65,61 +114,71 @@ export default function CameraScanner({ onScan, onClose, title = "Scan Barcode /
 
     return () => {
       cancelled = true;
-      if (scannerRef.current && scannerRef.current.isScanning) {
-        scannerRef.current.stop()
-          .catch(e => console.error("Failed to stop scanner on unmount", e));
-      }
+      void stopScanner();
     };
-  }, []);
+  }, [cameraLoadToken, loadHtml5Qrcode, stopScanner]);
 
   useEffect(() => {
     if (!selectedCameraId) return;
 
+    let cancelled = false;
     setIsInitializing(true);
     setError(null);
 
-    // Stop previous scanner if any
     const startScanner = async () => {
       try {
-        if (scannerRef.current) {
-          if (scannerRef.current.isScanning) {
-            await scannerRef.current.stop();
-          }
-        }
+        await stopScanner();
+        if (cancelled) return;
 
-        const Html5Qrcode = await loadHtml5Qrcode();
-        const html5QrCode = new Html5Qrcode(regionId);
+        const module = await loadHtml5Qrcode();
+        if (cancelled) return;
+
+        const html5QrCode = new module.Html5Qrcode(regionId, {
+          verbose: false,
+          formatsToSupport: getSupportedFormats(module),
+          useBarCodeDetectorIfSupported: true
+        } as any);
         scannerRef.current = html5QrCode;
+
+        const scanWidth = Math.min(320, Math.max(240, window.innerWidth - 64));
+        const scanHeight = Math.min(190, Math.round(scanWidth * 0.58));
 
         await html5QrCode.start(
           selectedCameraId,
           {
-            fps: 15,
-            qrbox: { width: 260, height: 150 },
-            aspectRatio: 1.777778 // 16:9
-          },
+            fps: 12,
+            qrbox: { width: scanWidth, height: scanHeight },
+            aspectRatio: 1.333333,
+            disableFlip: false
+          } as any,
           (decodedText) => {
-            // Success
-            if (decodedText) {
-              onScan(decodedText);
-              // Play a subtle beep if supported
-              try {
-                const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-                const osc = audioCtx.createOscillator();
-                osc.type = "sine";
-                osc.frequency.setValueAtTime(1000, audioCtx.currentTime);
-                osc.connect(audioCtx.destination);
-                osc.start();
-                osc.stop(audioCtx.currentTime + 0.08);
-              } catch (e) {}
-            }
+            const code = decodedText.trim();
+            const now = Date.now();
+            if (!code || (lastScanRef.current.text === code && now - lastScanRef.current.at < 1400)) return;
+
+            lastScanRef.current = { text: code, at: now };
+            onScanRef.current(code);
+
+            try {
+              const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+              const osc = audioCtx.createOscillator();
+              osc.type = "sine";
+              osc.frequency.setValueAtTime(1000, audioCtx.currentTime);
+              osc.connect(audioCtx.destination);
+              osc.start();
+              osc.stop(audioCtx.currentTime + 0.08);
+            } catch (e) {}
           },
           () => {
-            // Verbose error logging (ignored to avoid noise)
+            // Decode misses are expected between frames.
           }
         );
-        setIsInitializing(false);
+
+        if (!cancelled) {
+          setIsInitializing(false);
+        }
       } catch (err: any) {
+        if (cancelled) return;
         console.error("Failed to start scanner", err);
         setError(`Failed to initialize camera stream: ${err.message || err}`);
         setIsInitializing(false);
@@ -129,18 +188,30 @@ export default function CameraScanner({ onScan, onClose, title = "Scan Barcode /
     startScanner();
 
     return () => {
-      if (scannerRef.current && scannerRef.current.isScanning) {
-        scannerRef.current.stop()
-          .catch(e => console.error("Stop error on device change", e));
-      }
+      cancelled = true;
+      void stopScanner();
     };
-  }, [selectedCameraId, onScan]);
+  }, [selectedCameraId, restartToken, loadHtml5Qrcode, stopScanner]);
 
   const toggleCamera = () => {
     if (cameras.length <= 1) return;
     const currentIndex = cameras.findIndex(c => c.id === selectedCameraId);
     const nextIndex = (currentIndex + 1) % cameras.length;
     setSelectedCameraId(cameras[nextIndex].id);
+  };
+
+  const handleClose = () => {
+    void stopScanner().finally(onClose);
+  };
+
+  const handleRetry = () => {
+    setError(null);
+    setIsInitializing(true);
+    if (selectedCameraId) {
+      setRestartToken(token => token + 1);
+    } else {
+      setCameraLoadToken(token => token + 1);
+    }
   };
 
   return (
@@ -156,7 +227,7 @@ export default function CameraScanner({ onScan, onClose, title = "Scan Barcode /
             id="camera-scanner-close-btn"
             aria-label="Close scanner"
             title="Close scanner"
-            onClick={onClose}
+            onClick={handleClose}
             className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
           >
             <X className="w-5 h-5" />
@@ -201,7 +272,7 @@ export default function CameraScanner({ onScan, onClose, title = "Scan Barcode /
                 id="camera-scanner-retry-btn"
                 aria-label="Retry camera stream connection"
                 title="Retry camera stream connection"
-                onClick={() => setSelectedCameraId(prev => prev)}
+                onClick={handleRetry}
                 className="mt-2 px-4 py-2 bg-slate-850 hover:bg-slate-800 rounded-lg text-xs font-semibold border border-slate-700 transition-colors"
               >
                 Retry Stream Connection

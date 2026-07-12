@@ -423,10 +423,13 @@ export default function ReportsView({
   });
 
   // KPI Calculations
-  const refundTransactions = filteredSales.filter(item =>
+  const isRefundTransaction = (item: SaleWithItems) =>
     item.sale.isRefund || item.sale.paymentMethod === "REFUND" || item.sale.totalAmount < 0 ||
-    item.items.some(lineItem => lineItem.quantity < 0 || lineItem.price < 0)
-  );
+    item.items.some(lineItem => lineItem.quantity < 0 || lineItem.price < 0);
+
+  const refundTransactions = filteredSales.filter(isRefundTransaction);
+  const salesTransactions = filteredSales.filter(item => !isRefundTransaction(item));
+
   const getRefundAmount = (item: SaleWithItems) => {
     const refundedItemTotal = item.items.reduce((sum, lineItem) => {
       const lineTotal = lineItem.price * lineItem.quantity;
@@ -435,19 +438,24 @@ export default function ReportsView({
 
     return refundedItemTotal > 0 ? refundedItemTotal : Math.abs(item.sale.totalAmount);
   };
+
+  const grossRevenue = salesTransactions.reduce((sum, item) => sum + Math.max(0, item.sale.totalAmount), 0);
   const totalRefundAmount = refundTransactions.reduce((sum, item) => sum + getRefundAmount(item), 0);
-  const totalRevenue = filteredSales.reduce((sum, item) => sum + item.sale.totalAmount, 0);
+  const totalRevenue = grossRevenue - totalRefundAmount;
 
   // --- Summary breakdowns (by category & by payment type) ---
   const categoryLookup = new Map(menuItems.map((mi) => [mi.id, mi.category]));
 
   const categoryBreakdown = (() => {
     const acc: Record<string, { total: number; qty: number }> = {};
-    filteredSales.forEach((entry) => {
+    salesTransactions.forEach((entry) => {
       entry.items.forEach((it) => {
+        const lineTotal = it.price * it.quantity;
+        if (it.quantity <= 0 || lineTotal <= 0) return;
+
         const cat = categoryLookup.get(it.menuItemId) || "General";
         if (!acc[cat]) acc[cat] = { total: 0, qty: 0 };
-        acc[cat].total += it.price * it.quantity;
+        acc[cat].total += lineTotal;
         acc[cat].qty += it.quantity;
       });
     });
@@ -458,12 +466,8 @@ export default function ReportsView({
 
   const paymentBreakdown = (() => {
     const acc: Record<string, { total: number; count: number }> = {};
-    filteredSales.forEach((entry) => {
-      if (entry.sale.isRefund) {
-        if (!acc["REFUND"]) acc["REFUND"] = { total: 0, count: 0 };
-        acc["REFUND"].total += entry.sale.totalAmount;
-        acc["REFUND"].count += 1;
-      } else if (entry.sale.paymentMethod === "SPLIT") {
+    salesTransactions.forEach((entry) => {
+      if (entry.sale.paymentMethod === "SPLIT") {
         const transferAmt = entry.sale.splitTransferAmount !== undefined 
           ? entry.sale.splitTransferAmount 
           : entry.sale.totalAmount;
@@ -488,12 +492,15 @@ export default function ReportsView({
         acc[method].count += 1;
       }
     });
+    if (totalRefundAmount > 0) {
+      acc["REFUND"] = { total: -totalRefundAmount, count: refundTransactions.length };
+    }
     return Object.entries(acc)
       .map(([method, d]) => ({ method, total: d.total, count: d.count }))
-      .sort((a, b) => b.total - a.total);
+      .sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
   })();
 
-  const grandRevenue = totalRevenue || 0;
+  const grandRevenue = grossRevenue || 0;
   const cur = "\u20AD";
 
   const paymentLabel = (method: string) => {
@@ -503,26 +510,25 @@ export default function ReportsView({
       QR: "ໂອນ (QR)",
       HOLD: "ພັກບິນ",
       SPLIT: "ແບ່ງຊຳລະ (ສົດ+ໂອນ)",
+      REFUND: "REFUND",
     };
     return labels[method] || method;
   };
 
-  const totalTransactionsCount = filteredSales.length;
-  const averageTicketSize = totalTransactionsCount > 0 ? totalRevenue / totalTransactionsCount : 0;
+  const totalTransactionsCount = salesTransactions.length;
+  const averageTicketSize = totalTransactionsCount > 0 ? grossRevenue / totalTransactionsCount : 0;
 
   // Calculate profit
   const totalProfit = filteredSales.reduce((profitSum, item) => {
-    const subtotalAfterItemDiscounts = item.items.reduce((sum, it) => sum + it.price * it.quantity, 0);
-    const billDiscountAmt = item.sale.discountAmount || 0;
-    const finalSubtotal = subtotalAfterItemDiscounts - billDiscountAmt;
-      
-    const cost = item.items.reduce((sum, it) => {
+    const lineProfit = item.items.reduce((sum, it) => {
       const menuItem = menuItems.find(mi => mi.id === it.menuItemId);
       const c = it.costPrice !== undefined ? it.costPrice : (menuItem?.costPrice || 0);
-      return sum + c * it.quantity;
+      return sum + (it.price - c) * it.quantity;
     }, 0);
+
+    const billDiscountAmt = item.sale.discountType ? (item.sale.discountAmount || 0) : 0;
     
-    return profitSum + (finalSubtotal - cost);
+    return profitSum + (lineProfit - billDiscountAmt);
   }, 0);
 
   const profitMargin = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
@@ -810,13 +816,14 @@ export default function ReportsView({
         <>
           {/* KPI Cards Bento Grid */}
       <div id="reports-kpi-grid" className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-        {/* Total Revenue KPI */}
+        {/* Net Sales KPI */}
         <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-[0_4px_16px_rgba(0,0,0,0.01)] flex items-center justify-between">
           <div className="space-y-1.5">
-            <span className="text-xs font-semibold text-slate-400 font-sans">ຍອດຂາຍລວມ</span>
+            <span className="text-xs font-semibold text-slate-400 font-sans">ຍອດຂາຍສຸດທິ (Net Sales)</span>
             <h3 className="text-xl font-bold text-slate-900 font-mono">
               ₭{totalRevenue.toLocaleString(undefined, { minimumFractionDigits: 2 })}
             </h3>
+            <p className="text-[10px] text-slate-500 font-semibold font-sans">Gross {cur}{grossRevenue.toLocaleString(undefined, { minimumFractionDigits: 2 })} - refunds</p>
             <p className="text-[10px] text-slate-400 font-bold uppercase">{getDateRangeString()}</p>
           </div>
           <div className="p-3 bg-blue-50 text-blue-600 border border-blue-100 rounded-2xl">
@@ -827,11 +834,11 @@ export default function ReportsView({
         {/* Total Profit KPI */}
         <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-[0_4px_16px_rgba(0,0,0,0.01)] flex items-center justify-between">
           <div className="space-y-1.5">
-            <span className="text-xs font-semibold text-slate-400 font-sans">ກຳໄລລວມ</span>
+            <span className="text-xs font-semibold text-slate-400 font-sans">ກຳໄລສຸດທິ (Net Profit)</span>
             <h3 className="text-xl font-bold text-emerald-700 font-mono">
               ₭{totalProfit.toLocaleString(undefined, { minimumFractionDigits: 2 })}
             </h3>
-            <p className="text-[10px] text-emerald-600 font-bold uppercase">Margin: {profitMargin.toFixed(1)}%</p>
+            <p className="text-[10px] text-emerald-600 font-bold uppercase">After refunds: Margin {profitMargin.toFixed(1)}%</p>
           </div>
           <div className="p-3 bg-emerald-50 text-emerald-600 border border-emerald-100 rounded-2xl">
             <Banknote className="w-6 h-6" />
@@ -845,7 +852,7 @@ export default function ReportsView({
             <h3 className="text-xl font-bold text-rose-700 font-mono">
               ₭{totalRefundAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
             </h3>
-            <p className="text-[10px] text-rose-500 font-semibold italic font-sans">{refundTransactions.length} ບິນຄືນເງິນ</p>
+            <p className="text-[10px] text-rose-500 font-semibold italic font-sans">Money returned - {refundTransactions.length} refund bills</p>
           </div>
           <div className="p-3 bg-rose-50 text-rose-600 border border-rose-100 rounded-2xl">
             <ArrowRightLeft className="w-6 h-6" />
@@ -855,11 +862,11 @@ export default function ReportsView({
         {/* Transaction Count KPI */}
         <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-[0_4px_16px_rgba(0,0,0,0.01)] flex items-center justify-between">
           <div className="space-y-1.5">
-            <span className="text-xs font-semibold text-slate-400 font-sans">ຈຳນວນທຸລະກຳ</span>
+            <span className="text-xs font-semibold text-slate-400 font-sans">ຈຳນວນບິນຂາຍ</span>
             <h3 className="text-xl font-bold text-slate-900 font-mono">
               {totalTransactionsCount} <span className="font-sans">ບິນ</span>
             </h3>
-            <p className="text-[10px] text-slate-400 font-semibold italic font-sans">ບິນທີ່ຂາຍແລ້ວ</p>
+            <p className="text-[10px] text-slate-400 font-semibold italic font-sans">Refund bills separate: {refundTransactions.length}</p>
           </div>
           <div className="p-3 bg-indigo-50 text-indigo-500 border border-indigo-100 rounded-2xl">
             <Calendar className="w-6 h-6" />
@@ -873,7 +880,7 @@ export default function ReportsView({
             <h3 className="text-xl font-bold text-slate-900 font-mono">
               ₭{averageTicketSize.toLocaleString(undefined, { minimumFractionDigits: 2 })}
             </h3>
-            <p className="text-[10px] text-slate-400 font-semibold italic font-sans">ລາຍຮັບສະເລ່ຍ</p>
+            <p className="text-[10px] text-slate-400 font-semibold italic font-sans">Gross sales / sale bills</p>
           </div>
           <div className="p-3 bg-amber-50 text-amber-500 border border-amber-100 rounded-2xl">
             <TrendingUp className="w-6 h-6 transform rotate-90" />
@@ -889,7 +896,10 @@ export default function ReportsView({
             <div className="p-2 bg-indigo-50 text-indigo-600 border border-indigo-100 rounded-xl">
               <Layers className="w-4 h-4" />
             </div>
-            <h3 className="text-sm font-bold text-slate-700 font-sans">{"ສະຫຼຸບຕາມໝວດໝູ່"}</h3>
+            <div>
+              <h3 className="text-sm font-bold text-slate-700 font-sans">{"ສະຫຼຸບຕາມໝວດໝູ່"}</h3>
+              <p className="text-[10px] text-slate-400 font-sans">Gross sales only; refunds are excluded here.</p>
+            </div>
           </div>
           {categoryBreakdown.length === 0 ? (
             <p className="text-xs text-slate-400 py-4 text-center font-sans">—</p>
@@ -922,27 +932,32 @@ export default function ReportsView({
             <div className="p-2 bg-emerald-50 text-emerald-600 border border-emerald-100 rounded-xl">
               <Wallet className="w-4 h-4" />
             </div>
-            <h3 className="text-sm font-bold text-slate-700 font-sans">{"ສະຫຼຸບຕາມການຊຳລະ"}</h3>
+            <div>
+              <h3 className="text-sm font-bold text-slate-700 font-sans">{"ສະຫຼຸບຕາມການຊຳລະ"}</h3>
+              <p className="text-[10px] text-slate-400 font-sans">Sales inflow plus refund outflow.</p>
+            </div>
           </div>
           {paymentBreakdown.length === 0 ? (
             <p className="text-xs text-slate-400 py-4 text-center font-sans">—</p>
           ) : (
             <div className="space-y-2.5">
               {paymentBreakdown.map((row) => {
-                const pct = grandRevenue > 0 ? (row.total / grandRevenue) * 100 : 0;
+                const pct = grandRevenue > 0 ? (Math.abs(row.total) / grandRevenue) * 100 : 0;
                 const isCash = row.method === "CASH";
+                const isRefund = row.method === "REFUND";
+                const amountText = `${row.total < 0 ? "-" : ""}${cur}${Math.abs(row.total).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
                 return (
-                  <div key={row.method} id={`reports-pay-row-${row.method}`} className="flex items-center justify-between gap-3 p-2.5 rounded-2xl bg-slate-50 border border-slate-100">
+                  <div key={row.method} id={`reports-pay-row-${row.method}`} className={`flex items-center justify-between gap-3 p-2.5 rounded-2xl border ${isRefund ? "bg-rose-50 border-rose-100" : "bg-slate-50 border-slate-100"}`}>
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <div className={`p-1.5 rounded-lg ${isCash ? "bg-emerald-100 text-emerald-600" : "bg-blue-100 text-blue-600"}`}>
+                      <div className={`p-1.5 rounded-lg ${isRefund ? "bg-rose-100 text-rose-600" : isCash ? "bg-emerald-100 text-emerald-600" : "bg-blue-100 text-blue-600"}`}>
                         {isCash ? <Banknote className="w-4 h-4" /> : <ArrowRightLeft className="w-4 h-4" />}
                       </div>
                       <div className="flex flex-col min-w-0">
-                        <span className="text-xs font-bold text-slate-700 font-sans truncate">{paymentLabel(row.method)}</span>
-                        <span className="text-[10px] text-slate-400 font-sans">{row.count} ({pct.toFixed(1)}%)</span>
+                        <span className={`text-xs font-bold font-sans truncate ${isRefund ? "text-rose-700" : "text-slate-700"}`}>{paymentLabel(row.method)}</span>
+                        <span className={`text-[10px] font-sans ${isRefund ? "text-rose-500" : "text-slate-400"}`}>{row.count} ({pct.toFixed(1)}%){isRefund ? " money returned" : ""}</span>
                       </div>
                     </div>
-                    <span className="text-sm font-bold text-slate-800 font-mono whitespace-nowrap">{cur}{row.total.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                    <span className={`text-sm font-bold font-mono whitespace-nowrap ${isRefund ? "text-rose-700" : "text-slate-800"}`}>{amountText}</span>
                   </div>
                 );
               })}
@@ -953,7 +968,7 @@ export default function ReportsView({
 
       {/* Reports Actions Bar (XLSX, CSV) */}
       <div id="reports-export-actions" className="bg-white p-4 rounded-3xl border border-slate-100 flex justify-between items-center font-sans">
-        <span className="text-xs font-bold text-slate-500">ພົບ {filteredSales.length} ທຸລະກຳ</span>
+        <span className="text-xs font-bold text-slate-500">ພົບ {totalTransactionsCount} ບິນຂາຍ / {refundTransactions.length} refund</span>
         <div className="flex gap-2">
           <button
             id="reports-export-csv"

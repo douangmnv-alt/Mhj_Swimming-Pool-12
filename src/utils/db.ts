@@ -428,16 +428,21 @@ export const db = {
       this.insertStockLog(id, menuItem.name, -q, isRefund ? "REFUND" : "SALE", newStock);
     });
 
-    // Whole-bill discount calculation
+    // Whole-bill discount calculation. Refund rows carry negative quantities,
+    // so the bill discount must keep the same sign as the transaction.
     let billDiscountAmount = 0;
     if (billDiscount) {
+      const discountBase = Math.abs(subtotalAll);
       if (billDiscount.type === "PERCENT") {
-        billDiscountAmount = subtotalAll * (billDiscount.value / 100);
+        billDiscountAmount = discountBase * (billDiscount.value / 100);
       } else {
         billDiscountAmount = billDiscount.value;
       }
+      billDiscountAmount = roundMoney(Math.min(discountBase, Math.max(0, billDiscountAmount)));
+      if (isRefund) {
+        billDiscountAmount = -billDiscountAmount;
+      }
     }
-    billDiscountAmount = roundMoney(Math.min(subtotalAll, billDiscountAmount));
     const finalSubtotal = roundMoney(isRefund ? (subtotalAll - billDiscountAmount) : Math.max(0, subtotalAll - billDiscountAmount));
 
     const settings = this.getSettings();
